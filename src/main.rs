@@ -8,7 +8,7 @@ mod ui;
 
 use anyhow::Result;
 use app::App;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 /// Options derived from CLI that affect game behaviour (spawn delay, lock delay, sand settle, etc.).
 #[derive(Debug, Clone)]
@@ -54,11 +54,11 @@ fn main() -> Result<()> {
 )]
 pub struct Args {
     /// Game mode: endless (play until game over), timed (score in 3 min), or clear (clear N lines to win).
-    #[arg(short, long, default_value = "endless", value_parser = parse_mode)]
+    #[arg(short, long, default_value = "endless")]
     pub mode: GameMode,
 
     /// Difficulty: easy (normal speed), medium (faster), hard (fast + narrower). Affects gravity and playfield.
-    #[arg(short, long, default_value = "easy", value_parser = parse_difficulty)]
+    #[arg(short, long, default_value = "easy")]
     pub difficulty: Difficulty,
 
     /// Path to theme file (btop-style theme[key]=\"value\"). Uses One Dark if not set.
@@ -122,31 +122,23 @@ pub struct Args {
     pub high_color: bool,
 
     /// Colour palette: normal (theme), high-contrast, or colorblind.
-    #[arg(long, default_value = "normal", value_parser = parse_palette)]
+    #[arg(long, default_value = "normal")]
     pub palette: Palette,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum Palette {
     #[default]
     Normal,
+
+    #[value(alias = "highcontrast", alias = "contrast")]
     HighContrast,
+
+    #[value(alias = "colourblind")]
     Colorblind,
 }
 
-fn parse_palette(s: &str) -> Result<Palette, clap::Error> {
-    match s.to_lowercase().as_str() {
-        "normal" | "default" => Ok(Palette::Normal),
-        "high-contrast" | "highcontrast" | "contrast" => Ok(Palette::HighContrast),
-        "colorblind" | "colourblind" => Ok(Palette::Colorblind),
-        _ => Err(clap::Error::raw(
-            clap::error::ErrorKind::InvalidValue,
-            "palette must be: normal, high-contrast, colorblind\n",
-        )),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum GameMode {
     #[default]
     Endless,
@@ -154,36 +146,12 @@ pub enum GameMode {
     Clear,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum Difficulty {
     #[default]
     Easy,
     Medium,
     Hard,
-}
-
-fn parse_mode(s: &str) -> Result<GameMode, clap::Error> {
-    match s.to_lowercase().as_str() {
-        "endless" => Ok(GameMode::Endless),
-        "timed" => Ok(GameMode::Timed),
-        "clear" => Ok(GameMode::Clear),
-        _ => Err(clap::Error::raw(
-            clap::error::ErrorKind::InvalidValue,
-            "mode must be: endless, timed, clear\n",
-        )),
-    }
-}
-
-fn parse_difficulty(s: &str) -> Result<Difficulty, clap::Error> {
-    match s.to_lowercase().as_str() {
-        "easy" => Ok(Difficulty::Easy),
-        "medium" => Ok(Difficulty::Medium),
-        "hard" => Ok(Difficulty::Hard),
-        _ => Err(clap::Error::raw(
-            clap::error::ErrorKind::InvalidValue,
-            "difficulty must be: easy, medium, hard\n",
-        )),
-    }
 }
 
 /// Playfield width (no difficulty override).
