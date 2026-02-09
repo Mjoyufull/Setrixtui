@@ -7,6 +7,11 @@ Terminal puzzle game: Setris/Sandtrix-style falling blocks that turn into sand. 
 - Rust 1.86+ (ratatui 0.30)
 - Edition 2024
 
+## Installation
+```bash
+cargo install setrixtui
+```
+
 ```bash
 cargo build --release
 ./target/release/setrixtui
