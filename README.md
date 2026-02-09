@@ -88,3 +88,5 @@ Themes are btop-style: `theme[key]="value"` with hex colours. Example: `onedark.
 - **Tuning**: `--tick-rate`, `--frame-rate`, `--spawn-delay-ms`, `--lock-delay-ms`, `--initial-level`, `--relaxed`, `--sand-settle`, `--no-animation`, `--no-menu`, `--high-color`.
 
 Full list: `setrixtui --help`.
+
+bit of help from gemini flash from antigravity and zeditor (struggled with codex still learning how to use AI)
