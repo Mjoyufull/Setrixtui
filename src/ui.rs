@@ -279,9 +279,28 @@ pub fn draw(
     high_scores: HighScores,
     new_high_score_this_game: bool,
     time_to_40_secs: Option<u64>,
+    autoplay: bool,
 ) {
     match screen {
-        Screen::Menu => draw_menu(frame, state, menu_state, area, now, menu_playfield_size),
+        Screen::Menu => {
+            // Draw game in background if Autopilot is active
+            if autoplay {
+                 draw_game(
+                    frame,
+                    state,
+                    area,
+                    mode,
+                    time_limit,
+                    game_start,
+                    now,
+                    high_scores,
+                    time_to_40_secs,
+                    clear_lines,
+                    autoplay,
+                 );
+            }
+            draw_menu(frame, state, menu_state, area, now, menu_playfield_size);
+        }
         Screen::Playing => {
             draw_game(
                 frame,
@@ -294,6 +313,7 @@ pub fn draw(
                 high_scores,
                 time_to_40_secs,
                 clear_lines,
+                autoplay,
             );
             if paused {
                 draw_pause_overlay(frame, state, area);
@@ -321,6 +341,7 @@ pub fn draw(
                 high_scores,
                 time_to_40_secs,
                 clear_lines,
+                autoplay,
             );
             if let Some(opt) = quit_selected {
                 draw_quit_menu(frame, state, opt);
@@ -523,6 +544,45 @@ fn draw_menu(
             mode_clear,
         ]),
         Line::from(""),
+        Line::from(Span::styled(
+            " ─ AUTOPILOT ─ ",
+            Style::default().fg(state.theme.div_line),
+        )),
+            Line::from(vec![
+            Span::styled(
+                if menu_state.autoplay_enabled { " ENABLED " } else { " DISABLED " },
+                tab_style(
+                    menu_state.current_tab == MenuTab::Autoplay,
+                    menu_state.autoplay_enabled,
+                    highlight_style,
+                    selected_style,
+                    normal_style,
+                ),
+            ),
+            Span::from("     "),
+            Span::styled(
+                " RESTART ",
+                Style::default().fg(state.theme.div_line)
+            ),
+             Span::styled(
+                if menu_state.auto_restart_enabled {
+                    " ON "
+                } else {
+                    " OFF "
+                },
+                tab_style(
+                    menu_state.current_tab == MenuTab::AutoRestart,
+                    menu_state.auto_restart_enabled,
+                    highlight_style,
+                    selected_style,
+                    normal_style,
+                ),
+            ),
+        ]),
+    ]);
+
+    lines.extend([
+        Line::from(""),
         Line::from(""),
         Line::from(start_btn),
         Line::from(""),
@@ -558,6 +618,7 @@ fn draw_menu(
     let anim_y_offset = ((1.0 - offset_t) * 10.0) as u16;
     let mut anim_popup = popup;
     anim_popup.y += anim_y_offset;
+    anim_popup = anim_popup.intersection(area);
 
     if t < 1.0 {
         // Fade in effect
@@ -566,6 +627,9 @@ fn draw_menu(
         // but for TUI we just render and use effect if possible.
         // Actually TachyonFX is better here.
     }
+
+    // Clear background for menu popup
+    frame.render_widget(ratatui::widgets::Clear, anim_popup);
 
     p.render(anim_popup, frame.buffer_mut());
 
@@ -711,6 +775,7 @@ fn draw_game(
     high_scores: HighScores,
     time_to_40_secs: Option<u64>,
     clear_lines: u32,
+    autoplay: bool,
 ) {
     let (pw, ph) =
         playfield_pixel_size(state.playfield.width as u16, state.playfield.height as u16);
@@ -759,7 +824,15 @@ fn draw_game(
         time_to_40_secs,
         clear_lines,
     );
-    draw_sidebar(frame, state, sidebar_area, mode, high_scores);
+    draw_sidebar(
+        frame,
+        state,
+        sidebar_area,
+        mode,
+        high_scores,
+        autoplay,
+        now,
+    );
 }
 
 fn draw_playfield(
@@ -908,7 +981,7 @@ fn get_piece_at_grain(state: &GameState, gx: usize, gy: usize) -> Option<Color> 
                 && gy as i32 >= pgy
                 && (gy as i32) < pgy + crate::game::GRAIN_SCALE as i32
             {
-                let color = state.piece_color(piece.kind);
+                let color = state.theme.sand_color(piece.color_index);
                 return Some(apply_shading(color, gx, gy, state));
             }
         }
@@ -926,6 +999,8 @@ fn draw_sidebar(
     area: Rect,
     mode: GameMode,
     high_scores: HighScores,
+    autoplay: bool,
+    now: Instant,
 ) {
     let title_style = Style::default().fg(state.theme.title);
     let fg_style = Style::default().fg(state.theme.main_fg);
@@ -951,20 +1026,47 @@ fn draw_sidebar(
         ])
         .split(area);
 
-    // --- Next (own border) ---
+    // --- Next Piece (own border) ---
+    // If Autoplay is on, indicate it here
     let next_outer = chunks[0];
     let next_block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style);
     let next_inner = next_block.inner(next_outer);
     next_block.render(next_outer, frame.buffer_mut());
-    let next_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(5)])
-        .split(next_inner);
-    Paragraph::new(Line::from(Span::styled("Next", title_style)))
-        .render(next_layout[0], frame.buffer_mut());
-    draw_next_preview(frame, state, next_layout[1]);
+
+    if autoplay {
+        // Red flashing text
+        let color = if (now.elapsed().as_millis() / 500) % 2 == 0 {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+        // Centered paragraph
+        let p = Paragraph::new(Span::styled("AUTOPLAY", Style::default().fg(color).bold()))
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::NONE));
+        
+        // Vertically center inside the box
+        let v_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(1), // Text height
+                Constraint::Min(0),
+            ])
+            .split(next_inner);
+            
+        p.render(v_layout[1], frame.buffer_mut());
+    } else {
+        let next_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(5)])
+            .split(next_inner);
+        Paragraph::new(Line::from(Span::styled("Next", title_style)))
+            .render(next_layout[0], frame.buffer_mut());
+        draw_next_preview(frame, state, next_layout[1]);
+    }
 
     // --- Colours (own border) ---
     let colours_outer = chunks[2];
@@ -1042,6 +1144,7 @@ fn draw_sidebar(
         .ratio(combo_ratio)
         .gauge_style(Style::default().fg(bar_color));
     gauge.render(combo_layout[1], frame.buffer_mut());
+    
 }
 
 /// Draw next piece as a small block preview (actual shape).
@@ -1058,14 +1161,14 @@ fn draw_next_preview(frame: &mut Frame, state: &GameState, area: Rect) {
         if i >= state.next_pieces.len() {
             break;
         }
-        let kind = state.next_pieces[i];
+        let (kind, color_index) = state.next_pieces[i];
         let sub_area = Rect {
             x: area.x + (i as u16 * pw),
             y: area.y,
             width: pw,
             height: area.height,
         };
-        draw_single_piece_preview(frame, state, sub_area, kind);
+        draw_single_piece_preview(frame, state, sub_area, kind, color_index);
     }
 }
 
@@ -1075,6 +1178,7 @@ fn draw_single_piece_preview(
     state: &GameState,
     area: Rect,
     kind: TetrominoKind,
+    color_index: u8,
 ) {
     let inner = Rect {
         x: area.x,
@@ -1083,7 +1187,7 @@ fn draw_single_piece_preview(
         height: area.height.min(NEXT_PREVIEW_ROWS * NEXT_MINI_CELL_H),
     };
 
-    let color = piece_color_static(state, kind);
+    let color = state.theme.sand_color(color_index);
     let cells = kind.cells();
     let (dx_lo, dy_lo) = cells
         .iter()
@@ -1115,9 +1219,6 @@ fn draw_single_piece_preview(
     }
 }
 
-fn piece_color_static(state: &GameState, kind: TetrominoKind) -> Color {
-    state.theme.sand_color(kind.color_index(state.high_color))
-}
 
 /// Draw a row of 6 coloured blocks (sand palette).
 fn draw_colour_strip(frame: &mut Frame, state: &GameState, area: Rect) {

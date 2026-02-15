@@ -6,10 +6,11 @@ mod highscores;
 mod input;
 mod theme;
 mod ui;
+mod autoplay;
 
 use anyhow::Result;
 use app::App;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 
 /// Options derived from CLI that affect game behaviour (spawn delay, lock delay, sand settle, etc.).
 #[derive(Debug, Clone)]
@@ -25,6 +26,15 @@ pub struct GameConfig {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.help_long {
+        Args::command().print_long_help().unwrap();
+        return Ok(());
+    }
+    if args.help_short {
+        Args::command().print_help().unwrap();
+        return Ok(());
+    }
     let theme = theme::Theme::load(args.theme.as_deref(), args.palette).unwrap_or_default();
     let config = GameConfig {
         spawn_delay_ms: args.spawn_delay_ms.unwrap_or(0),
@@ -51,7 +61,8 @@ fn main() -> Result<()> {
         lines (one colour edge-to-edge) to score; remaining sand falls with gravity.\n\n\
         CONTROLS (normal):\n  Left/Right  Move    Up        Rotate CW   Down       Soft drop\n  Enter/Space Hard drop   P          Pause      Q / Esc    Quit\n\n\
         CONTROLS (vim):\n  h/l         Move    k or i     Rotate CW   u          Rotate CCW\n  j           Soft drop  Space      Hard drop  p          Pause   q  Quit\n\n\
-        Hold a movement key to keep the piece moving. Use --theme to load a btop-style theme (e.g. onedark.theme)."
+        Hold a movement key to keep the piece moving. Use --theme to load a btop-style theme (e.g. onedark.theme).",
+    disable_help_flag = true,
 )]
 pub struct Args {
     /// Game mode: endless (play until game over), timed (score in time limit), or clear40 (clear 40 lines then keep going until fail).
@@ -125,6 +136,23 @@ pub struct Args {
     /// Colour palette: normal (theme), high-contrast, or colorblind.
     #[arg(long, default_value = "normal")]
     pub palette: Palette,
+
+    /// Toggle Autoplay mode (AI plays the game).
+    #[arg(long)]
+    pub autoplay: bool,
+
+    /// Auto-restart on game over (useful for autoplay).
+    #[arg(long, short = 'r', visible_alias = "ar")]
+    pub auto_restart: bool,
+
+    /// Print short help.
+    #[arg(short = 'h', long = "h", action = ArgAction::SetTrue)]
+    pub help_short: bool,
+
+    /// Print full tree-style help.
+    #[arg(long = "help", long = "Help", action = ArgAction::SetTrue)]
+    pub help_long: bool,
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]

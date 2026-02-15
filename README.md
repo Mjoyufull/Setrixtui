@@ -1,6 +1,6 @@
 <div align="center">
 
-  ![Logo](./assets/Screenshot_20260209-034648.png)
+  ![Logo](./assets/banner.png)
 
   **Setrixtui**
 

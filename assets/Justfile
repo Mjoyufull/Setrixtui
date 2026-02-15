@@ -1,0 +1,2 @@
+compile:
+	fd -e typ -E lib.typ -x typst c {} -f svg \; -x typst c {} -f png

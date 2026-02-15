@@ -4,6 +4,7 @@ use crate::theme::Theme;
 use ratatui::style::Color;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
+use fastrand::Rng;
 
 /// Scale factor: each tetromino block is `GRAIN_SCALE` x `GRAIN_SCALE` grains.
 pub const GRAIN_SCALE: usize = 6;
@@ -93,6 +94,7 @@ pub struct Piece {
     pub gx: i32,
     pub gy: i32,
     pub rotation: u8, // 0..4
+    pub color_index: u8,
 }
 
 impl Piece {
@@ -213,9 +215,34 @@ impl Playfield {
                         continue;
                     }
 
-                    // Collision check
+                    // Collision check with SAND
                     if let Some(Cell::Sand(..)) = self.get(gx as usize, gy as usize) {
                         return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Check collision with frozen grains (during crumble animation).
+    pub fn can_place_with_frozen(&self, piece: &Piece, frozen_grains: &[FrozenGrain]) -> bool {
+        if !self.can_place(piece) {
+            return false;
+        }
+        // Also check against frozen grains
+        let origins = piece.cell_grain_origins();
+        for (gx_origin, gy_origin) in origins {
+            for dy in 0..GRAIN_SCALE as i32 {
+                for dx in 0..GRAIN_SCALE as i32 {
+                    let gx = gx_origin + dx;
+                    let gy = gy_origin + dy;
+                    if gy >= 0 {
+                         for fg in frozen_grains {
+                             if fg.x == gx as usize && fg.y == gy as usize {
+                                 return false;
+                             }
+                         }
                     }
                 }
             }
@@ -359,14 +386,14 @@ impl Playfield {
 #[derive(Debug, Clone)]
 pub struct Bag {
     queue: Vec<TetrominoKind>,
-    rng: u32,
+    rng: Rng,
 }
 
 impl Bag {
-    pub fn new() -> Self {
+    pub fn new(seed: u64) -> Self {
         let mut b = Self {
             queue: Vec::with_capacity(14),
-            rng: 0x1234_5678,
+            rng: Rng::with_seed(seed),
         };
         b.refill();
         b
@@ -374,17 +401,8 @@ impl Bag {
 
     fn refill(&mut self) {
         let mut all = TetrominoKind::ALL.to_vec();
-        // Fisher–Yates shuffle
-        for i in (1..all.len()).rev() {
-            let j = (self.next_rand() as usize) % (i + 1);
-            all.swap(i, j);
-        }
+        self.rng.shuffle(&mut all);
         self.queue.extend(all);
-    }
-
-    fn next_rand(&mut self) -> u32 {
-        self.rng = self.rng.wrapping_mul(1_103_515_245).wrapping_add(12345);
-        self.rng >> 16
     }
 
     pub fn next(&mut self) -> TetrominoKind {
@@ -397,7 +415,7 @@ impl Bag {
 
 impl Default for Bag {
     fn default() -> Self {
-        Self::new()
+        Self::new(0x1234_5678)
     }
 }
 
@@ -412,12 +430,12 @@ pub struct ScorePopup {
 }
 
 /// Game state: playfield, current piece, next piece, score, level, etc.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GameState {
     pub theme: Theme,
     pub playfield: Playfield,
     pub piece: Option<Piece>,
-    pub next_pieces: Vec<TetrominoKind>,
+    pub next_pieces: Vec<(TetrominoKind, u8)>,
     pub bag: Bag,
     pub score: u32,
     pub level: u32,
@@ -448,16 +466,23 @@ pub struct GameState {
     /// Visual position (grain coords) for smooth sliding; interpolates toward piece.gx/gy each frame.
     piece_visual_gx: f32,
     piece_visual_gy: f32,
+    pub last_spawn_color: Option<u8>,
+    pub rng: Rng,
 }
 
 impl GameState {
     pub fn new(theme: Theme, width: u16, height: u16, config: &crate::GameConfig) -> Self {
-        let mut bag = Bag::new();
+        let seed = fastrand::u64(..);
+        let mut rng = Rng::with_seed(seed);
+        let mut bag = Bag::new(rng.u64(..));
         let p1 = bag.next();
         let p2 = bag.next();
         let p3 = bag.next();
         let p4 = bag.next();
-        let piece = Some(Self::spawn_piece(width, height, p1));
+
+        let c1 = p1.color_index(config.high_color);
+        let piece = Some(Self::spawn_piece(width, height, p1, c1));
+
         let (vx, vy) = piece
             .as_ref()
             .map(|p| (p.gx as f32, p.gy as f32))
@@ -465,14 +490,32 @@ impl GameState {
         let now = Instant::now();
         let spawn_ready_at = (config.spawn_delay_ms > 0)
             .then(|| now + std::time::Duration::from_millis(config.spawn_delay_ms));
+
+        let mut next_pieces = Vec::new();
+        let mut last_c = c1;
+        for kind in [p2, p3, p4] {
+            let repeat_chance = match config.difficulty {
+                crate::Difficulty::Easy => 0.40,
+                crate::Difficulty::Medium => 0.20,
+                crate::Difficulty::Hard => 0.08,
+            };
+            let mut nc = kind.color_index(config.high_color);
+            if rng.f32() < repeat_chance {
+                nc = last_c;
+            }
+            next_pieces.push((kind, nc));
+            last_c = nc;
+        }
+
         Self {
             theme,
             playfield: Playfield::new(width, height),
             piece,
-            next_pieces: vec![p2, p3, p4],
+            next_pieces,
             bag,
             score: 0,
             level: config.initial_level,
+            // ...
             lines_cleared: 0,
             game_over: false,
             line_clear_cells: Vec::new(),
@@ -492,6 +535,8 @@ impl GameState {
             combo_timer_ticks: 0,
             piece_visual_gx: vx,
             piece_visual_gy: vy,
+            last_spawn_color: Some(c1),
+            rng,
         }
     }
 
@@ -520,7 +565,7 @@ impl GameState {
         self.spawn_ready_at.map(|t| now < t).unwrap_or(false)
     }
 
-    pub fn spawn_piece(width: u16, _height: u16, kind: TetrominoKind) -> Piece {
+    pub fn spawn_piece(width: u16, _height: u16, kind: TetrominoKind, color_index: u8) -> Piece {
         let w = width as i32;
         let s = GRAIN_SCALE as i32;
         Piece {
@@ -528,6 +573,7 @@ impl GameState {
             gx: (w / 2 - 1).max(0) * s,
             gy: 0,
             rotation: 0,
+            color_index,
         }
     }
 
@@ -538,7 +584,8 @@ impl GameState {
         }
         if let Some(ref mut piece) = self.piece {
             piece.gy += 1;
-            if !self.playfield.can_place(piece) {
+            let can_place = self.playfield.can_place_with_frozen(piece, &self.frozen_grains);
+            if !can_place {
                 piece.gy -= 1;
                 // Instant crumble! The moment we hit something, it locks.
                 self.lock_piece();
@@ -561,7 +608,7 @@ impl GameState {
             let mut test_p = piece.clone();
             test_p.gy += 1;
 
-            if !self.playfield.can_place(&test_p) {
+            if !self.playfield.can_place_with_frozen(&test_p, &self.frozen_grains) {
                 // Piece is on the ground - lock instantly in Sandtrix
                 self.lock_piece();
             } else {
@@ -589,7 +636,7 @@ impl GameState {
         }
         if let Some(ref mut piece) = self.piece {
             piece.gx -= GRAIN_SCALE as i32;
-            if !self.playfield.can_place(piece) {
+            if !self.playfield.can_place_with_frozen(piece, &self.frozen_grains) {
                 piece.gx += GRAIN_SCALE as i32;
             }
         }
@@ -601,7 +648,7 @@ impl GameState {
         }
         if let Some(ref mut piece) = self.piece {
             piece.gx += GRAIN_SCALE as i32;
-            if !self.playfield.can_place(piece) {
+            if !self.playfield.can_place_with_frozen(piece, &self.frozen_grains) {
                 piece.gx -= GRAIN_SCALE as i32;
             }
         }
@@ -615,7 +662,7 @@ impl GameState {
         if let Some(ref mut piece) = self.piece {
             let old_rotation = piece.rotation;
             piece.rotation = (piece.rotation + 1) % 4;
-            if !self.playfield.can_place(piece) {
+            if !self.playfield.can_place_with_frozen(piece, &self.frozen_grains) {
                 piece.rotation = old_rotation;
             }
         }
@@ -628,7 +675,7 @@ impl GameState {
         if let Some(ref mut piece) = self.piece {
             let old_rotation = piece.rotation;
             piece.rotation = (piece.rotation + 3) % 4;
-            if !self.playfield.can_place(piece) {
+            if !self.playfield.can_place_with_frozen(piece, &self.frozen_grains) {
                 piece.rotation = old_rotation;
             }
         }
@@ -640,7 +687,7 @@ impl GameState {
         }
         if let Some(ref mut piece) = self.piece {
             piece.gy += 1;
-            if !self.playfield.can_place(piece) {
+            if !self.playfield.can_place_with_frozen(piece, &self.frozen_grains) {
                 piece.gy -= 1;
                 self.lock_piece();
             } else {
@@ -655,22 +702,25 @@ impl GameState {
         if self.game_over || self.line_clear_in_progress || self.is_spawn_delay(now) {
             return;
         }
-        if let Some(piece) = self.piece.clone() {
+        if let Some(piece) = &self.piece { // Avoid clone if possible, but we need mut access later
+            let mut p = piece.clone();
             let (_, gh) = self.playfield.grain_dims();
-            let mut pgy = piece.gy;
+            let mut pgy = p.gy;
+            
+            // Linear scan down
             while pgy < gh as i32 {
-                let mut p = piece.clone();
-                p.gy = pgy;
-                if !self.playfield.can_place(&p) {
-                    pgy -= 1;
+                p.gy = pgy + 1;
+                if !self.playfield.can_place_with_frozen(&p, &self.frozen_grains) {
                     break;
                 }
                 pgy += 1;
             }
+            
             let dist_grains = (pgy - piece.gy).max(0) as u32;
             self.score += (dist_grains / GRAIN_SCALE as u32) * 2;
-            if let Some(ref mut p) = self.piece {
-                p.gy = pgy;
+            
+            if let Some(ref mut p_ref) = self.piece {
+                p_ref.gy = pgy;
             }
             self.lock_piece();
         }
@@ -681,7 +731,7 @@ impl GameState {
             Some(p) => p,
             None => return,
         };
-        let color_index = piece.kind.color_index(self.high_color);
+        let color_index = piece.color_index;
 
         // --- PIECE FREEZING (Freeze & Crumble) ---
         // Instead of writing to the playfield instantly, we move grains to the frozen buffer.
@@ -915,12 +965,27 @@ impl GameState {
         let width = self.playfield.width as u16;
         let height = self.playfield.height as u16;
 
-        // Pull from queue
-        let next_kind = self.next_pieces.remove(0);
-        // Refill queue
-        self.next_pieces.push(self.bag.next());
+        // Pull from queue (kind, color)
+        let (next_kind, next_color) = self.next_pieces.remove(0);
 
-        self.piece = Some(Self::spawn_piece(width, height, next_kind));
+        // Add new piece to queue with bias
+        let new_kind = self.bag.next();
+        let repeat_chance = match self.difficulty {
+            crate::Difficulty::Easy => 0.40,
+            crate::Difficulty::Medium => 0.20,
+            crate::Difficulty::Hard => 0.08,
+        };
+
+        // Bias towards the color of the last piece currently in the queue
+        let last_queued_color = self.next_pieces.last().map(|(_, c)| *c).unwrap_or(next_color);
+        let mut new_color = new_kind.color_index(self.high_color);
+        if self.rng.f32() < repeat_chance {
+            new_color = last_queued_color;
+        }
+        self.next_pieces.push((new_kind, new_color));
+
+        self.last_spawn_color = Some(next_color);
+        self.piece = Some(Self::spawn_piece(width, height, next_kind, next_color));
         if let Some(ref p) = self.piece {
             self.piece_visual_gx = p.gx as f32;
             self.piece_visual_gy = p.gy as f32;
@@ -935,10 +1000,6 @@ impl GameState {
         if !self.playfield.can_place(self.piece.as_ref().unwrap()) {
             self.game_over = true;
         }
-    }
-
-    pub fn piece_color(&self, kind: TetrominoKind) -> Color {
-        self.theme.sand_color(kind.color_index(self.high_color))
     }
 
     pub fn tick_popups(&mut self, delta_ms: u32) {
