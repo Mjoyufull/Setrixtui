@@ -5,8 +5,10 @@ use crate::input::{Action, key_to_action};
 use crate::theme::Theme;
 use crate::{Args, GameConfig};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::DefaultTerminal;
+use ratatui::{
+    DefaultTerminal,
+    crossterm::event::{self, Event, KeyCode, KeyEventKind},
+};
 use std::time::{Duration, Instant};
 use tachyonfx::Effect;
 
@@ -300,7 +302,7 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        use crossterm::{
+        use ratatui::crossterm::{
             event::{
                 KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
             },
@@ -361,7 +363,7 @@ impl App {
             self.last_frame_time = now;
             self.state.tick_piece_visual(dt_secs);
             if self.screen == Screen::Menu {
-                let (c, r) = crossterm::terminal::size().unwrap_or((80, 24));
+                let (c, r) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
                 let (w, h) = crate::ui::playfield_size_for_terminal_clamped(c, r);
                 self.menu_playfield_width = w;
                 self.menu_playfield_height = h;
