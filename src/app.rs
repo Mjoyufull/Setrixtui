@@ -83,6 +83,8 @@ pub struct App {
     screen: Screen,
     paused: bool,
     game_start: Instant,
+    /// Elapsed seconds when game ended; used so game-over screen shows frozen time.
+    elapsed_secs_at_game_over: Option<u64>,
     game_over_reason: Option<GameOverReason>,
     last_tick: Instant,
     /// Base tick rate (Hz) for level-based speed when not relaxed.
@@ -168,6 +170,7 @@ impl App {
             screen,
             paused: false,
             game_start: now,
+            elapsed_secs_at_game_over: None,
             game_over_reason: None,
             last_tick: now,
             base_tick_rate: tick_rate,
@@ -211,6 +214,7 @@ impl App {
         self.state = GameState::new(self.theme.clone(), width, height, &self.config);
         self.paused = false;
         self.game_start = now;
+        self.elapsed_secs_at_game_over = None;
         self.game_over_reason = None;
         self.last_tick = now;
         self.last_input_time = now;
@@ -379,6 +383,7 @@ impl App {
                     self.args.clear_lines,
                     self.args.time_limit,
                     self.game_start,
+                    self.elapsed_secs_at_game_over,
                     f.area(),
                     &mut self.line_clear_effect,
                     &mut self.line_clear_effect_process_time,
@@ -883,6 +888,7 @@ impl App {
             if self.screen == Screen::Menu {
                  self.reset_game(false);
             } else {
+                 self.elapsed_secs_at_game_over = Some(self.game_start.elapsed().as_secs());
                  self.screen = Screen::GameOver;
             }
         } else if self.args.mode == crate::GameMode::Timed
@@ -903,10 +909,11 @@ impl App {
             if self.screen == Screen::Menu {
                  self.reset_game(false);
             } else {
+                 self.elapsed_secs_at_game_over = Some(self.game_start.elapsed().as_secs());
                  self.screen = Screen::GameOver;
             }
         }
-        
+
         // Handle clear animation finish
         if self.state.line_clear_in_progress
              && !self.args.no_animation

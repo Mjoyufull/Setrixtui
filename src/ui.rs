@@ -268,6 +268,7 @@ pub fn draw(
     clear_lines: u32,
     time_limit: u32,
     game_start: Instant,
+    elapsed_secs_at_game_over: Option<u64>,
     area: Rect,
     line_clear_effect: &mut Option<Effect>,
     line_clear_process_time: &mut Option<Instant>,
@@ -347,19 +348,22 @@ pub fn draw(
                 draw_quit_menu(frame, state, opt);
             }
         }
-        Screen::GameOver => draw_game_over(
-            frame,
-            state,
-            game_over_reason,
-            mode,
-            clear_lines,
-            time_limit,
-            game_start,
-            area,
-            high_scores,
-            new_high_score_this_game,
-            time_to_40_secs,
-        ),
+        Screen::GameOver => {
+            let elapsed_secs = elapsed_secs_at_game_over.unwrap_or_else(|| game_start.elapsed().as_secs());
+            draw_game_over(
+                frame,
+                state,
+                game_over_reason,
+                mode,
+                clear_lines,
+                time_limit,
+                elapsed_secs,
+                area,
+                high_scores,
+                new_high_score_this_game,
+                time_to_40_secs,
+            );
+        }
     }
 }
 
@@ -674,7 +678,7 @@ fn draw_game_over(
     mode: GameMode,
     clear_lines: u32,
     time_limit: u32,
-    game_start: Instant,
+    elapsed_secs: u64,
     area: Rect,
     high_scores: HighScores,
     new_high_score_this_game: bool,
@@ -730,15 +734,13 @@ fn draw_game_over(
         )));
     }
     if reason == Some(GameOverReason::TimeUp) {
-        let elapsed = game_start.elapsed().as_secs();
         lines.push(Line::from(Span::styled(
-            format!(" Time: {} / {} sec ", elapsed, time_limit),
+            format!(" Time: {} / {} sec ", elapsed_secs, time_limit),
             Style::default().fg(state.theme.main_fg),
         )));
     } else if mode == GameMode::Clear {
-        let elapsed = game_start.elapsed().as_secs();
         lines.push(Line::from(Span::styled(
-            format!(" Time: {:02}:{:02} ", elapsed / 60, elapsed % 60),
+            format!(" Time: {:02}:{:02} ", elapsed_secs / 60, elapsed_secs % 60),
             Style::default().fg(state.theme.main_fg),
         )));
         if let Some(t40) = time_to_40_secs {
