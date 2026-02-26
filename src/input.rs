@@ -1,6 +1,6 @@
 //! Key bindings: normal and vim-style.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Action from a key press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
