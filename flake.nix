@@ -50,7 +50,7 @@
         apps = {
           default = {
             type = "app";
-            program = [ "${packages.default}/bin/setrixtui" ];
+            program = "${packages.default}/bin/setrixtui";
           };
         };
       }
