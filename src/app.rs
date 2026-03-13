@@ -9,6 +9,8 @@ use ratatui::{
     DefaultTerminal,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
 };
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::time::{Duration, Instant};
 use tachyonfx::Effect;
 
@@ -16,6 +18,11 @@ use tachyonfx::Effect;
 const REPEAT_DELAY_MS: u64 = 80;
 /// ARR (Auto-Repeat Rate): time between repeated moves while holding.
 const REPEAT_INTERVAL_MS: u64 = 38;
+/// tmux/zellij do not reliably report release events. Allow enough time for the
+/// first internal repeat to start, then require much fresher same-direction
+/// signals so movement stops close to the actual release.
+const MULTIPLEXER_INITIAL_KEEPALIVE_MS: u64 = 110;
+const MULTIPLEXER_REPEAT_KEEPALIVE_MS: u64 = 72;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -93,6 +100,11 @@ pub struct App {
     base_tick_rate: f64,
     repeat_state: Option<(Action, Instant)>,
     last_repeat_fire: Option<Instant>,
+    last_repeat_signal: Option<Instant>,
+    multiplexer_repeat_armed: bool,
+    input_in_multiplexer: bool,
+    keyboard_enhancements_enabled: bool,
+    input_trace: Option<std::fs::File>,
     last_input_time: Instant,
     line_clear_started: Option<Instant>,
     /// `TachyonFX` fade effect for line-clear (created when animation starts).
@@ -139,7 +151,15 @@ impl App {
         let height = args.height;
 
         let autoplay = if args.no_menu { args.autoplay } else { false };
-        let auto_restart = if args.no_menu { args.auto_restart } else { false };
+        let auto_restart = if args.no_menu {
+            args.auto_restart
+        } else {
+            false
+        };
+        let input_in_multiplexer =
+            std::env::var_os("TMUX").is_some() || std::env::var_os("ZELLIJ").is_some();
+        let input_trace = std::env::var_os("SETRIXTUI_INPUT_TRACE")
+            .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok());
 
         #[allow(clippy::needless_borrow)]
         let state = GameState::new(theme.clone(), width, height, &config);
@@ -178,6 +198,11 @@ impl App {
             base_tick_rate: tick_rate,
             repeat_state: None,
             last_repeat_fire: None,
+            last_repeat_signal: None,
+            multiplexer_repeat_armed: false,
+            input_in_multiplexer,
+            keyboard_enhancements_enabled: false,
+            input_trace,
             last_input_time: now,
             line_clear_started: None,
             line_clear_effect: None,
@@ -209,7 +234,6 @@ impl App {
         let now = Instant::now();
         let old_menu_state = self.menu_state.clone();
 
-
         // Recalculate base tick rate according to current difficulty
         self.base_tick_rate = default_tick_rate_for_difficulty(self.args.difficulty);
 
@@ -222,6 +246,8 @@ impl App {
         self.last_input_time = now;
         self.repeat_state = None;
         self.last_repeat_fire = None;
+        self.last_repeat_signal = None;
+        self.multiplexer_repeat_armed = false;
         self.line_clear_started = None;
         self.line_clear_effect = None;
         self.line_clear_effect_process_time = None;
@@ -251,9 +277,9 @@ impl App {
         if to_playing {
             self.screen = Screen::Playing;
         } else if prev_screen == Screen::Menu && self.autoplay {
-             self.screen = Screen::Menu;
+            self.screen = Screen::Menu;
         } else {
-             self.screen = Screen::Playing;
+            self.screen = Screen::Playing;
         }
     }
 
@@ -267,9 +293,23 @@ impl App {
             Action::SoftDrop => self.state.soft_drop(now),
             Action::HardDrop => {
                 self.state.hard_drop(now);
-                self.repeat_state = None;
+                self.clear_repeat_state();
             }
         }
+    }
+
+    fn clear_repeat_state(&mut self) {
+        self.repeat_state = None;
+        self.last_repeat_fire = None;
+        self.last_repeat_signal = None;
+        self.multiplexer_repeat_armed = false;
+    }
+
+    fn seed_repeat_state(&mut self, action: Action, now: Instant, multiplexer_repeat_armed: bool) {
+        self.repeat_state = Some((action, now));
+        self.last_repeat_fire = None;
+        self.last_repeat_signal = Some(now);
+        self.multiplexer_repeat_armed = multiplexer_repeat_armed;
     }
 
     fn tick_repeat(&mut self) {
@@ -277,31 +317,115 @@ impl App {
         let Some((action, first)) = self.repeat_state else {
             return;
         };
-        if action == Action::Quit
-            || action == Action::HardDrop
-            || action == Action::Pause
-            || action == Action::None
-        {
+
+        if !Self::action_uses_hold_repeat(action) {
             return;
         }
 
-        // Removed safety fallback that assumed sticky keys after 100ms;
-        // now relying on KeyEventKind::Release and standard DAS/ARR logic.
+        if self.input_in_multiplexer {
+            let Some(last_signal) = self.last_repeat_signal else {
+                self.clear_repeat_state();
+                return;
+            };
+            let keepalive_ms = if self.last_repeat_fire.is_none() {
+                MULTIPLEXER_INITIAL_KEEPALIVE_MS
+            } else {
+                MULTIPLEXER_REPEAT_KEEPALIVE_MS
+            };
+            if now.duration_since(last_signal) > Duration::from_millis(keepalive_ms) {
+                self.clear_repeat_state();
+                return;
+            }
+            if !self.multiplexer_repeat_armed {
+                return;
+            }
+        }
 
-        if first.elapsed() < Duration::from_millis(REPEAT_DELAY_MS) {
+        if now.duration_since(first) < Duration::from_millis(REPEAT_DELAY_MS) {
             return;
         }
+
         let next =
             self.last_repeat_fire.unwrap_or(first) + Duration::from_millis(REPEAT_INTERVAL_MS);
-        if now >= next {
-            self.apply_action(action, now);
-            if matches!(
-                action,
-                Action::MoveLeft | Action::MoveRight | Action::RotateCw | Action::RotateCcw
-            ) {
-                self.state.on_move_or_rotate(now);
+        if now < next {
+            return;
+        }
+
+        self.apply_action(action, now);
+        if matches!(
+            action,
+            Action::MoveLeft | Action::MoveRight | Action::RotateCw | Action::RotateCcw
+        ) {
+            self.state.on_move_or_rotate(now);
+        }
+        self.last_repeat_fire = Some(now);
+    }
+
+    fn trace_input_event(
+        &mut self,
+        now: Instant,
+        key: ratatui::crossterm::event::KeyEvent,
+        action: Action,
+        accepted: bool,
+    ) {
+        let Some(file) = self.input_trace.as_mut() else {
+            return;
+        };
+        let _ = writeln!(
+            file,
+            "t={}ms kind={:?} code={:?} mods={:?} state={:?} action={:?} accepted={} mux={}",
+            now.duration_since(self.game_start).as_millis(),
+            key.kind,
+            key.code,
+            key.modifiers,
+            key.state,
+            action,
+            accepted,
+            self.input_in_multiplexer,
+        );
+        let _ = file.flush();
+    }
+
+    const fn action_uses_hold_repeat(action: Action) -> bool {
+        matches!(
+            action,
+            Action::MoveLeft | Action::MoveRight | Action::SoftDrop
+        )
+    }
+
+    fn should_allow_repeat_input(&self, action: Action) -> bool {
+        self.screen == Screen::Playing && !self.paused && Self::action_uses_hold_repeat(action)
+    }
+
+    fn should_process_press(&mut self, action: Action, now: Instant) -> bool {
+        if action == Action::None {
+            return false;
+        }
+
+        if !Self::action_uses_hold_repeat(action) {
+            self.clear_repeat_state();
+            return true;
+        }
+
+        if self.input_in_multiplexer {
+            return match self.repeat_state {
+                Some((last_action, _)) if last_action == action => {
+                    self.last_repeat_signal = Some(now);
+                    false
+                }
+                _ => {
+                    self.seed_repeat_state(action, now, true);
+                    true
+                }
+            };
+        }
+
+        match self.repeat_state {
+            Some((last_action, _)) if last_action == action => false,
+            _ => {
+                self.seed_repeat_state(action, now, true);
+                true
             }
-            self.last_repeat_fire = Some(now);
         }
     }
 
@@ -320,11 +444,19 @@ impl App {
         let mut stdout = std::io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
 
-        // Attempt to enable enhanced keyboard for Release events
-        let _ = execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
-        );
+        // `PushKeyboardEnhancementFlags` negotiates kitty keyboard protocol. tmux/zellij
+        // do not behave like a plain kitty-protocol endpoint, so keep multiplexers on
+        // conservative press-only handling.
+        if !self.input_in_multiplexer {
+            if execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            )
+            .is_ok()
+            {
+                self.keyboard_enhancements_enabled = true;
+            }
+        }
 
         let mut terminal =
             ratatui::DefaultTerminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
@@ -352,7 +484,9 @@ impl App {
         let result = self.run_loop(&mut terminal);
 
         // Restore
-        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        if self.keyboard_enhancements_enabled {
+            let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        }
         execute!(std::io::stdout(), LeaveAlternateScreen)?;
         disable_raw_mode()?;
 
@@ -436,7 +570,6 @@ impl App {
             let loop_elapsed = now.elapsed();
             let timeout = frame_duration.saturating_sub(loop_elapsed);
 
-
             // Tick popups
             self.state.tick_popups(16);
 
@@ -484,22 +617,39 @@ impl App {
                 while event::poll(Duration::ZERO)? {
                     if let Event::Key(key) = event::read()? {
                         let action = key_to_action(key);
-                        self.last_input_time = Instant::now();
+                        let input_now = Instant::now();
+                        self.last_input_time = input_now;
+                        let allow_repeat_input = self.should_allow_repeat_input(action);
 
-                        // Ignore OS repeats and only process first Press.
-                        // Filter out redundant OS presses if we're already repeating that action ourselves.
-                        if key.kind != KeyEventKind::Press {
-                            if key.kind == KeyEventKind::Release
-                                && self.repeat_state.map(|(a, _)| a) == Some(action)
-                            {
-                                self.repeat_state = None;
-                                self.last_repeat_fire = None;
+                        if key.kind == KeyEventKind::Release {
+                            if self.repeat_state.map(|(a, _)| a) == Some(action) {
+                                self.clear_repeat_state();
                             }
+                            self.trace_input_event(input_now, key, action, false);
                             continue;
                         }
 
-                        // If we are already repeating this action, ignore subsequent OS Press events
-                        if self.repeat_state.map(|(a, _)| a) == Some(action) {
+                        let accepts_event_kind = if self.input_in_multiplexer && allow_repeat_input
+                        {
+                            key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat
+                        } else {
+                            key.kind == KeyEventKind::Press
+                        };
+                        if !accepts_event_kind {
+                            self.trace_input_event(input_now, key, action, false);
+                            continue;
+                        }
+
+                        let accepted = if allow_repeat_input {
+                            self.should_process_press(action, input_now)
+                        } else {
+                            if action != Action::None {
+                                self.clear_repeat_state();
+                            }
+                            true
+                        };
+                        self.trace_input_event(input_now, key, action, accepted);
+                        if !accepted {
                             continue;
                         }
 
@@ -581,7 +731,9 @@ impl App {
                                             match self.menu_state.current_tab {
                                                 MenuTab::Difficulty => MenuTab::Mode,
                                                 MenuTab::Mode => MenuTab::Autoplay,
-                                                MenuTab::Autoplay | MenuTab::AutoRestart => MenuTab::Start,
+                                                MenuTab::Autoplay | MenuTab::AutoRestart => {
+                                                    MenuTab::Start
+                                                }
                                                 MenuTab::Start => MenuTab::Difficulty,
                                             };
                                     }
@@ -590,7 +742,9 @@ impl App {
                                             match self.menu_state.current_tab {
                                                 MenuTab::Difficulty => MenuTab::Start,
                                                 MenuTab::Mode => MenuTab::Difficulty,
-                                                MenuTab::Autoplay | MenuTab::AutoRestart => MenuTab::Mode,
+                                                MenuTab::Autoplay | MenuTab::AutoRestart => {
+                                                    MenuTab::Mode
+                                                }
                                                 MenuTab::Start => MenuTab::Autoplay,
                                             };
                                     }
@@ -606,13 +760,18 @@ impl App {
                                                 self.menu_playfield_height;
                                             // Apply autoplay setting from menu
                                             self.autoplay = self.menu_state.autoplay_enabled;
-                                            self.auto_restart = self.menu_state.auto_restart_enabled;
+                                            self.auto_restart =
+                                                self.menu_state.auto_restart_enabled;
                                             self.reset_game(true);
                                         } else if self.menu_state.current_tab == MenuTab::Autoplay {
                                             // Toggle autoplay with Enter/HardDrop
-                                             self.menu_state.autoplay_enabled = !self.menu_state.autoplay_enabled;
-                                        } else if self.menu_state.current_tab == MenuTab::AutoRestart {
-                                             self.menu_state.auto_restart_enabled = !self.menu_state.auto_restart_enabled;
+                                            self.menu_state.autoplay_enabled =
+                                                !self.menu_state.autoplay_enabled;
+                                        } else if self.menu_state.current_tab
+                                            == MenuTab::AutoRestart
+                                        {
+                                            self.menu_state.auto_restart_enabled =
+                                                !self.menu_state.auto_restart_enabled;
                                         } else {
                                             self.menu_state.current_tab = MenuTab::Start;
                                         }
@@ -667,32 +826,30 @@ impl App {
                                             self.screen = Screen::QuitMenu;
                                             self.quit_selected = QuitOption::Resume;
                                         }
-                                        Action::MoveLeft | Action::MoveRight | Action::RotateCw 
-                                        | Action::RotateCcw | Action::SoftDrop | Action::HardDrop => {
-                                             self.apply_action(action, now);
-                                             if matches!(action, Action::MoveLeft | Action::MoveRight 
-                                                 | Action::RotateCw | Action::RotateCcw) {
-                                                 self.state.on_move_or_rotate(now);
-                                             }
+                                        Action::MoveLeft
+                                        | Action::MoveRight
+                                        | Action::RotateCw
+                                        | Action::RotateCcw
+                                        | Action::SoftDrop
+                                        | Action::HardDrop => {
+                                            self.apply_action(action, input_now);
+                                            if matches!(
+                                                action,
+                                                Action::MoveLeft
+                                                    | Action::MoveRight
+                                                    | Action::RotateCw
+                                                    | Action::RotateCcw
+                                            ) {
+                                                self.state.on_move_or_rotate(input_now);
+                                            }
                                         }
                                         _ => {}
-                                    }
-                                    
-                                    let repeatable = matches!(
-                                        action,
-                                        Action::MoveLeft | Action::MoveRight | Action::SoftDrop
-                                    );
-                                    if repeatable {
-                                        self.repeat_state = Some((action, now));
-                                        self.last_repeat_fire = None;
                                     }
                                 }
 
                                 // If the action caused a lock, clear repeat state to prevent "input memory"
-                                if self.state.line_clear_in_progress
-                                    || self.state.piece.is_none()
-                                {
-                                    self.repeat_state = None;
+                                if self.state.line_clear_in_progress || self.state.piece.is_none() {
+                                    self.clear_repeat_state();
                                 }
                             }
                             Screen::QuitMenu => {
@@ -744,10 +901,10 @@ impl App {
                     }
                 }
             }
-            
+
             // Should we tick game logic?
             // Yes if playing, OR if in Menu and autoplay is enabled (background preview)
-            let should_tick = (self.screen == Screen::Playing && !self.paused) 
+            let should_tick = (self.screen == Screen::Playing && !self.paused)
                 || (self.screen == Screen::Menu && self.autoplay);
 
             if should_tick {
@@ -788,10 +945,7 @@ impl App {
                     self.apply_action(auto_action, now_ap);
                     if matches!(
                         auto_action,
-                        Action::MoveLeft
-                            | Action::MoveRight
-                            | Action::RotateCw
-                            | Action::RotateCcw
+                        Action::MoveLeft | Action::MoveRight | Action::RotateCw | Action::RotateCcw
                     ) {
                         self.state.on_move_or_rotate(now_ap);
                     }
@@ -830,7 +984,7 @@ impl App {
         {
             self.time_to_40_secs = Some(self.game_start.elapsed().as_secs());
         }
-        
+
         // Game Over Logic
         if self.state.game_over {
             // AUTO RESTART LOGIC
@@ -860,7 +1014,7 @@ impl App {
                         self.high_score_timed = self.state.score;
                         self.new_high_score_this_game = true;
                         if !self.autoplay {
-                             let _ = crate::highscores::save_high_scores(
+                            let _ = crate::highscores::save_high_scores(
                                 self.high_score_endless,
                                 self.high_score_timed,
                                 self.high_score_clear,
@@ -888,10 +1042,10 @@ impl App {
             // If in menu, showing game over screen is weird.
             // If in menu, we should probably just reset silently.
             if self.screen == Screen::Menu {
-                 self.reset_game(false);
+                self.reset_game(false);
             } else {
-                 self.elapsed_secs_at_game_over = Some(self.game_start.elapsed().as_secs());
-                 self.screen = Screen::GameOver;
+                self.elapsed_secs_at_game_over = Some(self.game_start.elapsed().as_secs());
+                self.screen = Screen::GameOver;
             }
         } else if self.args.mode == crate::GameMode::Timed
             && self.game_start.elapsed() >= Duration::from_secs(u64::from(self.args.time_limit))
@@ -909,22 +1063,22 @@ impl App {
                 }
             }
             if self.screen == Screen::Menu {
-                 self.reset_game(false);
+                self.reset_game(false);
             } else {
-                 self.elapsed_secs_at_game_over = Some(self.game_start.elapsed().as_secs());
-                 self.screen = Screen::GameOver;
+                self.elapsed_secs_at_game_over = Some(self.game_start.elapsed().as_secs());
+                self.screen = Screen::GameOver;
             }
         }
 
         // Handle clear animation finish
         if self.state.line_clear_in_progress
-             && !self.args.no_animation
-             && self.line_clear_effect.as_ref().is_some_and(Effect::done)
+            && !self.args.no_animation
+            && self.line_clear_effect.as_ref().is_some_and(Effect::done)
         {
-             self.state.finish_line_clear();
-             self.line_clear_effect = None;
-             self.line_clear_effect_process_time = None;
-             self.line_clear_started = None;
+            self.state.finish_line_clear();
+            self.line_clear_effect = None;
+            self.line_clear_effect_process_time = None;
+            self.line_clear_started = None;
         }
         // Handle instant clear (no animation)
         if self.state.line_clear_in_progress
